@@ -1,0 +1,117 @@
+/* docs/_pdf_style.css
+   Stylesheet for docs/report.pdf — kept next to the report so the
+   build command is fully reproducible from the repo. */
+
+html, body {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 12pt;
+  line-height: 1.55;
+  color: #1d1d1f;
+  margin: 0;
+  padding: 0;
+}
+
+/* Headings: clear hierarchy without being shouty. */
+h1 {
+  font-size: 22pt;
+  line-height: 1.25;
+  margin: 0 0 0.4em 0;
+  border-bottom: 2px solid #222;
+  padding-bottom: 0.2em;
+  page-break-after: avoid;
+}
+h2 {
+  font-size: 16pt;
+  margin: 1.6em 0 0.5em 0;
+  border-bottom: 1px solid #bbb;
+  padding-bottom: 0.15em;
+  page-break-after: avoid;
+}
+h3 {
+  font-size: 13.5pt;
+  margin: 1.3em 0 0.4em 0;
+  page-break-after: avoid;
+}
+h4 {
+  font-size: 12pt;
+  margin: 1.1em 0 0.3em 0;
+  font-style: italic;
+  page-break-after: avoid;
+}
+
+p {
+  margin: 0 0 0.7em 0;
+  text-align: justify;
+}
+
+/* Lists */
+ul, ol {
+  margin: 0.4em 0 0.9em 1.6em;
+  padding: 0;
+}
+li { margin-bottom: 0.25em; }
+
+/* Inline code and fenced blocks */
+code {
+  font-family: "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 10.5pt;
+  background: #f4f4f6;
+  padding: 0.05em 0.3em;
+  border-radius: 3px;
+}
+pre {
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  font-size: 10pt;
+  line-height: 1.4;
+  background: #f4f4f6;
+  padding: 0.8em 1em;
+  border: 1px solid #e2e2e2;
+  border-radius: 4px;
+  overflow-x: auto;
+  page-break-inside: avoid;
+  white-space: pre;
+}
+pre code {
+  background: transparent;
+  padding: 0;
+  font-size: inherit;
+}
+
+/* Tables */
+table {
+  border-collapse: collapse;
+  margin: 0.8em 0 1.1em 0;
+  width: 100%;
+  font-size: 11pt;
+  page-break-inside: avoid;
+}
+th, td {
+  border: 1px solid #bfbfbf;
+  padding: 0.45em 0.6em;
+  text-align: left;
+  vertical-align: top;
+}
+th {
+  background: #ececec;
+  font-weight: 600;
+}
+
+/* Blockquotes and horizontal rules */
+blockquote {
+  border-left: 3px solid #bfbfbf;
+  margin: 0.8em 0;
+  padding: 0.2em 0 0.2em 1em;
+  color: #555;
+  font-style: italic;
+}
+hr {
+  border: none;
+  border-top: 1px solid #c8c8c8;
+  margin: 1.8em 0;
+}
+
+/* Links stay black on print — keeps the report looking academic. */
+a, a:visited {
+  color: #1d1d1f;
+  text-decoration: underline;
+}
