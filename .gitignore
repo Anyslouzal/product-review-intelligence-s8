@@ -1,0 +1,31 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.python-version
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local dataset artefacts (downloaded on demand)
+data/reviews.csv
+
+# Runtime logs (kept folder, ignore contents)
+logs/*
+!logs/.gitkeep
+
+# IDEs
+.vscode/
+.idea/
