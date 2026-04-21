@@ -29,3 +29,5 @@ logs/*
 # IDEs
 .vscode/
 .idea/
+models/bert_sentiment/model.safetensors
+models/bert_sentiment/model.pt
