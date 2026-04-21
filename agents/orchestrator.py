@@ -1,21 +1,28 @@
 """
 agents/orchestrator.py
 ----------------------
-CrewAI orchestrator that analyses one product review and returns
-structured JSON (sentiment, key themes, one-sentence summary).
+Week 3 multi-agent orchestrator.
 
-Week 2 upgrade:
-    The orchestrator no longer guesses sentiment from the LLM alone —
-    it now calls the fine-tuned BERT classifier exposed by
-    ``tools.SentimentAnalysisTool``. The LLM is still responsible for
-    theme extraction and summarization, and for merging the BERT
-    sentiment into the final JSON.
+The single-agent prototype from W1/W2 is now split into three roles
+running inside a single sequential Crew:
 
-Topology:
-    * one Agent  -> "Product Review Orchestrator"
-    * one Tool   -> sentiment_classifier (BERT)
-    * one Task   -> instructs the agent to call the tool then compose JSON
-    * one Crew   -> runs the task sequentially
+    1. SentimentAgent    — calls the BERT sentiment_classifier tool.
+    2. MarketAgent       — calls the DuckDuckGo web_search tool for
+                           competitive context.
+    3. ReportAgent       — synthesises the two specialist outputs into
+                           the final JSON contract.
+
+A Human-In-The-Loop (HITL) checkpoint runs after the sentiment task:
+the reviewer is shown the BERT classification and asked to approve
+before the market/report stages fire. Rejection raises a ValueError
+so the whole pipeline halts cleanly.
+
+Every task output is appended to ``logs/run_log.json`` with a UTC
+timestamp, agent name, task identifier, and the raw agent output.
+
+Public API:
+    ``analyze_review(review_text: str) -> dict``
+        Unchanged from previous weeks — main.py keeps working.
 """
 
 from __future__ import annotations
@@ -23,111 +30,135 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from crewai import Agent, Crew, Process, Task
 from dotenv import load_dotenv
+from langchain.tools import Tool
 from langchain_openai import ChatOpenAI
 
-from tools import SentimentAnalysisTool
+from agents.sentiment_agent import build_sentiment_agent
+from agents.market_agent import build_market_agent
 
 # ---------------------------------------------------------------------------
-# LLM backend
+# crewai==0.5.0 workaround
 # ---------------------------------------------------------------------------
-# crewai==0.5.0 does not ship a `crewai.llm` module, so we plug a
-# LangChain ChatOpenAI model directly into the Agent. We target
-# gpt-4o-mini — cheap, fast, and reliable for structured JSON output.
+# In crewai==0.5.0 a tool-less agent can short-circuit and return an
+# `AgentFinish` object that the executor does not know how to unwrap,
+# producing:
+#     ValueError: Unexpected output type from agent: AgentFinish
+# Giving the agent a no-op tool forces the executor through its tool
+# loop, which handles the final output correctly. The agent never
+# actually calls this tool because the prompt tells it not to.
+_dummy_tool = Tool(
+    name="no_op",
+    func=lambda x: x,
+    description="No-op tool. Do not use.",
+)
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 load_dotenv()
 
-_llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    openai_api_key=os.getenv("OPENAI_API_KEY"),
-)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_RUN_LOG_PATH = _PROJECT_ROOT / "logs" / "run_log.json"
+_RUN_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
 
 # ---------------------------------------------------------------------------
-# Tools
+# Logging helper
 # ---------------------------------------------------------------------------
-# Instantiated once at import time so the underlying BERT weights are
-# loaded lazily on first use and then shared across all Crew runs.
-_sentiment_tool = SentimentAnalysisTool()
-
-# ---------------------------------------------------------------------------
-# Agent definition
-# ---------------------------------------------------------------------------
-# The triad (role / goal / backstory) shapes the system prompt CrewAI
-# builds internally. Keep the goal precise: it is the contract we expect
-# the agent to fulfil on every call.
-_orchestrator_agent = Agent(
-    role="Product Review Orchestrator",
-    goal=(
-        "Analyze a product review and return a structured JSON with: "
-        "sentiment (positive/neutral/negative), key themes (list), and a "
-        "one-sentence summary. You MUST obtain the sentiment label by "
-        "calling the sentiment_classifier tool — never guess it yourself."
-    ),
-    backstory="You are an expert product analyst.",
-    llm=_llm,
-    tools=[_sentiment_tool],
-    verbose=False,       # flip to True during debugging
-    allow_delegation=False,  # single-agent crew — nothing to delegate to yet
-)
+def _utc_now() -> str:
+    """ISO-8601 UTC timestamp used in every log record."""
+    return datetime.now(timezone.utc).isoformat()
 
 
-def _build_task(review_text: str) -> Task:
-    """Create a fresh Task bound to the review we want analysed.
+def _append_log(entry: dict[str, Any]) -> None:
+    """Append an audit record to ``logs/run_log.json``.
 
-    We rebuild the Task per call (instead of reusing one instance) so the
-    description always contains the current review verbatim — CrewAI does
-    not re-render templates at execution time.
+    The log is stored as a JSON array so downstream tooling (pandas,
+    jq) can read the whole history in one shot. We do a
+    load-modify-write on each call rather than streaming newline-JSON,
+    which keeps the file valid JSON at all times.
     """
-    description = (
-        "Analyse the following product review.\n\n"
-        f"REVIEW:\n\"\"\"{review_text}\"\"\"\n\n"
-        "Workflow you MUST follow:\n"
-        "  1. Call the `sentiment_classifier` tool with the review text "
-        "as its input. The tool returns a JSON string containing the "
-        "sentiment label, a confidence score, and per-class "
-        "probabilities from a fine-tuned BERT model. Use the tool's "
-        "`label` field verbatim as the sentiment value — do not "
-        "override it with your own opinion.\n"
-        "  2. Read the review yourself to extract up to 5 short key "
-        "themes and write a one-sentence summary.\n"
-        "  3. Compose the final answer.\n\n"
-        "Return ONLY a valid JSON object (no markdown fences, no prose) "
-        "with EXACTLY these keys:\n"
-        '  - "sentiment": one of "positive", "neutral", "negative" '
-        "(copied from the tool output)\n"
-        '  - "key_themes": a list of short strings (max 5 items)\n'
-        '  - "summary": a single sentence summarising the review\n'
+    existing: list[dict[str, Any]] = []
+    if _RUN_LOG_PATH.exists() and _RUN_LOG_PATH.stat().st_size > 0:
+        try:
+            loaded = json.loads(_RUN_LOG_PATH.read_text(encoding="utf-8"))
+            existing = loaded if isinstance(loaded, list) else [loaded]
+        except json.JSONDecodeError:
+            # Corrupted log — start fresh rather than crashing the run.
+            existing = []
+
+    existing.append(entry)
+    _RUN_LOG_PATH.write_text(
+        json.dumps(existing, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
 
-    expected_output = (
-        'A JSON object like: {"sentiment": "positive", '
-        '"key_themes": ["battery life", "build quality"], '
-        '"summary": "The reviewer loved the long battery life and solid feel."}'
-    )
 
-    return Task(
-        description=description,
-        expected_output=expected_output,
-        agent=_orchestrator_agent,
+def _log_task(agent_name: str, task_name: str, output: Any) -> None:
+    """Standardised per-task log record."""
+    _append_log(
+        {
+            "timestamp_utc": _utc_now(),
+            "agent": agent_name,
+            "task": task_name,
+            "output": str(output),
+        }
     )
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Report agent (defined here because it only exists to merge outputs)
+# ---------------------------------------------------------------------------
+def _build_report_agent() -> Agent:
+    """Create the ReportAgent that composes the final JSON.
+
+    Kept local to the orchestrator since it has no tools of its own —
+    it is purely an LLM-driven synthesiser.
+    """
+    llm = ChatOpenAI(
+        model="gpt-4o-mini",
+        openai_api_key=os.getenv("OPENAI_API_KEY"),
+        temperature=0.0,       # synthesis must be reproducible
+    )
+    return Agent(
+        role="Report Synthesizer",
+        goal=(
+            "Combine the sentiment classification and the market "
+            "research summary into a single structured JSON report."
+        ),
+        backstory=(
+            "You are the final editor. You trust the Sentiment "
+            "Specialist's label (it came from a fine-tuned BERT model) "
+            "and you trust the Market Specialist's competitive "
+            "summary. Your only job is to merge them into the exact "
+            "JSON schema the downstream pipeline expects."
+        ),
+        llm=llm,
+        # Dummy tool attached purely to work around the crewai==0.5.0
+        # AgentFinish bug — see note at top of file.
+        tools=[_dummy_tool],
+        allow_delegation=False,
+        verbose=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# JSON parsing helper (unchanged from W2)
 # ---------------------------------------------------------------------------
 def _coerce_to_dict(raw_output: str) -> dict[str, Any]:
-    """Best-effort parse of the LLM's text output into a Python dict.
+    """Best-effort parse of an LLM's text output into a dict.
 
-    Gemini is generally good at honouring the "JSON only" instruction, but
-    occasionally wraps the object in ```json ... ``` fences. We strip any
-    such fencing before json.loads, and fall back to a regex scan for the
-    first balanced {...} block if the direct parse fails.
+    Strips optional ```json fences and falls back to a regex scan for
+    the first balanced ``{...}`` block if direct parsing fails.
     """
     text = raw_output.strip()
 
-    # Strip ```json ... ``` or ``` ... ``` fences if present.
     fenced = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, flags=re.DOTALL)
     if fenced:
         text = fenced.group(1).strip()
@@ -135,15 +166,135 @@ def _coerce_to_dict(raw_output: str) -> dict[str, Any]:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # Fallback: grab the first {...} block we can find.
         match = re.search(r"\{.*\}", text, flags=re.DOTALL)
         if match:
             return json.loads(match.group(0))
-        raise  # re-raise the original error for the caller to handle
+        raise
 
 
+# ---------------------------------------------------------------------------
+# HITL checkpoint
+# ---------------------------------------------------------------------------
+def _sentiment_hitl_checkpoint(raw_output: Any) -> None:
+    """Pause the pipeline and ask the human to approve the sentiment.
+
+    Called as a Task callback right after the SentimentAgent finishes.
+    Raising ValueError halts the sequential Crew before the market or
+    report tasks are dispatched.
+    """
+    _log_task(
+        agent_name="Sentiment Analysis Specialist",
+        task_name="sentiment_analysis",
+        output=raw_output,
+    )
+
+    print("\n--- HITL checkpoint: sentiment result ---")
+    print(raw_output)
+    approval = input("Approve sentiment? (y/n): ").strip().lower()
+    if approval in ("n", "no"):
+        raise ValueError("Sentiment rejected by human reviewer")
+
+
+# ---------------------------------------------------------------------------
+# Task factory
+# ---------------------------------------------------------------------------
+def _build_tasks(
+    review_text: str,
+    sentiment_agent: Agent,
+    market_agent: Agent,
+    report_agent: Agent,
+) -> tuple[Task, Task, Task]:
+    """Build the three sequential tasks for one review.
+
+    Tasks are rebuilt per call so the ``review_text`` is interpolated
+    verbatim into the description (CrewAI does not re-render templates
+    at execution time).
+    """
+
+    # ---- Task 1: sentiment ------------------------------------------------
+    sentiment_task = Task(
+        description=(
+            "Classify the sentiment of the following product review by "
+            "calling the `sentiment_classifier` tool with the review "
+            "text. Do NOT guess the sentiment yourself.\n\n"
+            f"REVIEW:\n\"\"\"{review_text}\"\"\"\n\n"
+            "Return ONLY the JSON string produced by the tool — it "
+            "already contains the keys `label`, `confidence`, and "
+            "`scores`."
+        ),
+        expected_output=(
+            'A JSON string like: {"label": "positive", '
+            '"confidence": 0.97, "scores": {"negative": 0.01, '
+            '"neutral": 0.02, "positive": 0.97}}'
+        ),
+        agent=sentiment_agent,
+        # After this task, pause for human approval (and log).
+        callback=_sentiment_hitl_checkpoint,
+    )
+
+    # ---- Task 2: market research -----------------------------------------
+    market_task = Task(
+        description=(
+            "Using the `web_search` tool, gather competitive market "
+            "context about the product described in the review below. "
+            "Formulate 1–2 focused queries (e.g. product category, "
+            "distinguishing features, competitor names) and synthesise "
+            "the hits into a short competitive summary (3–5 sentences).\n\n"
+            f"REVIEW:\n\"\"\"{review_text}\"\"\"\n\n"
+            "You may also take the sentiment from the previous task "
+            "(available in your context) into account when framing the "
+            "summary."
+        ),
+        expected_output=(
+            "A concise plaintext paragraph (3–5 sentences) summarising "
+            "the competitive landscape for this product."
+        ),
+        agent=market_agent,
+        context=[sentiment_task],
+        callback=lambda out: _log_task(
+            "Market Research Specialist", "market_research", out
+        ),
+    )
+
+    # ---- Task 3: final synthesis -----------------------------------------
+    report_task = Task(
+        description=(
+            "You are given two upstream outputs in your context:\n"
+            "  - A JSON sentiment object with `label`, `confidence`, "
+            "and `scores`.\n"
+            "  - A plaintext competitive summary.\n\n"
+            "Read the original review yourself to extract up to 5 "
+            "short key themes and a one-sentence summary.\n\n"
+            f"REVIEW:\n\"\"\"{review_text}\"\"\"\n\n"
+            "Return ONLY a valid JSON object (no markdown fences, no "
+            "prose) with EXACTLY these keys:\n"
+            '  - "sentiment": one of "positive", "neutral", "negative" '
+            "(copied from the sentiment task's `label`)\n"
+            '  - "confidence": float from the sentiment task\n'
+            '  - "key_themes": list of up to 5 short strings\n'
+            '  - "summary": one sentence summarising the review\n'
+            '  - "market_context": the competitive summary from the '
+            "market task\n"
+        ),
+        expected_output=(
+            'A JSON object with keys sentiment, confidence, '
+            'key_themes, summary, market_context.'
+        ),
+        agent=report_agent,
+        context=[sentiment_task, market_task],
+        callback=lambda out: _log_task(
+            "Report Synthesizer", "final_report", out
+        ),
+    )
+
+    return sentiment_task, market_task, report_task
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 def analyze_review(review_text: str) -> dict[str, Any]:
-    """Run the orchestrator crew on a single review.
+    """Run the full 3-agent pipeline on a single review.
 
     Parameters
     ----------
@@ -153,44 +304,81 @@ def analyze_review(review_text: str) -> dict[str, Any]:
     Returns
     -------
     dict
-        Parsed JSON with keys ``sentiment``, ``key_themes``, ``summary``.
-        If parsing fails, the dict will contain a ``raw`` key with the
-        untouched LLM output and an ``error`` key describing the issue —
-        this keeps main.py from crashing mid-batch.
+        JSON with ``sentiment``, ``confidence``, ``key_themes``,
+        ``summary``, and ``market_context``. If parsing fails, the
+        dict contains ``raw`` and ``error`` keys so main.py can keep
+        iterating through the batch.
+
+    Raises
+    ------
+    ValueError
+        When the human reviewer rejects the sentiment at the HITL
+        checkpoint. Callers can catch this to skip the review or abort
+        the batch.
     """
-    # Guard against empty input: CrewAI would still execute, but burning
-    # free-tier quota on an empty string is wasteful.
     if not review_text or not review_text.strip():
         return {
             "sentiment": "neutral",
+            "confidence": 0.0,
             "key_themes": [],
             "summary": "Empty review — nothing to analyse.",
+            "market_context": "",
         }
 
-    task = _build_task(review_text)
+    # Fresh agents per call -> no state leaks between reviews.
+    sentiment_agent = build_sentiment_agent()
+    market_agent = build_market_agent()
+    report_agent = _build_report_agent()
 
-    # A Crew with a single agent and a single task running sequentially is
-    # the simplest possible CrewAI topology. We recreate it per call so
-    # state never leaks between reviews.
+    sentiment_task, market_task, report_task = _build_tasks(
+        review_text=review_text,
+        sentiment_agent=sentiment_agent,
+        market_agent=market_agent,
+        report_agent=report_agent,
+    )
+
     crew = Crew(
-        agents=[_orchestrator_agent],
-        tasks=[task],
+        agents=[sentiment_agent, market_agent, report_agent],
+        tasks=[sentiment_task, market_task, report_task],
         process=Process.sequential,
         verbose=False,
     )
 
-    # kickoff() returns a CrewOutput; .raw is the final string the agent
-    # produced. We coerce it into a dict before handing it back.
+    # Mark the start of this run in the audit log so grouping by
+    # timestamp is easy even if multiple reviews run back-to-back.
+    _append_log(
+        {
+            "timestamp_utc": _utc_now(),
+            "agent": "orchestrator",
+            "task": "pipeline_start",
+            "output": review_text,
+        }
+    )
+
+    # kickoff() runs the tasks sequentially; per-task callbacks handle
+    # logging and the HITL checkpoint.
     crew_output = crew.kickoff()
     raw_text = str(getattr(crew_output, "raw", crew_output))
 
     try:
-        return _coerce_to_dict(raw_text)
+        result = _coerce_to_dict(raw_text)
     except (json.JSONDecodeError, ValueError) as exc:
-        return {
+        result = {
             "sentiment": "unknown",
+            "confidence": 0.0,
             "key_themes": [],
-            "summary": "Failed to parse model output.",
+            "summary": "Failed to parse final report.",
+            "market_context": "",
             "raw": raw_text,
             "error": str(exc),
         }
+
+    _append_log(
+        {
+            "timestamp_utc": _utc_now(),
+            "agent": "orchestrator",
+            "task": "pipeline_end",
+            "output": result,
+        }
+    )
+    return result
