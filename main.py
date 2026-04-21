@@ -1,15 +1,17 @@
 """
 main.py
 -------
-Week 1 entry point. Runs the orchestrator agent against three hardcoded
-example reviews (positive / negative / mixed), prints the structured
-result to the console, and appends each run to logs/run_log.json with a
-UTC timestamp.
+Demo entry point for the product-review-intelligence pipeline.
 
-Why a JSON log?
-    - It is machine-readable (easy to diff between weekly runs).
-    - It gives the oral-defence panel a clear audit trail of every
-      agent action, which is an explicit project constraint.
+Stages:
+    1. Analyse three canonical reviews (positive / negative / mixed).
+    2. (W4) Run three edge cases through the guardrails so a reviewer
+       can see the robustness layer in action without reading the
+       test harness.
+
+Every run is appended to logs/run_log.json with a UTC timestamp. The
+file is machine-readable, provides an auditable trail of every agent
+action, and is easy to diff between weekly deliverables.
 """
 
 from __future__ import annotations
@@ -50,6 +52,22 @@ EXAMPLE_REVIEWS: list[dict[str, str]] = [
     },
 ]
 
+# W4: three deliberately awkward inputs to demonstrate the guardrails.
+# The first and third should be rejected by `validate_review` BEFORE
+# the crew is spun up; the French review should pass the guardrail
+# and exercise the full pipeline on non-English text.
+EDGE_CASE_REVIEWS: list[dict[str, str]] = [
+    {"label": "edge_empty", "text": ""},
+    {
+        "label": "edge_french",
+        "text": (
+            "Ce produit est absolument incroyable, je le recommande "
+            "vivement!"
+        ),
+    },
+    {"label": "edge_single_word", "text": "Good"},
+]
+
 
 def _append_log_entry(entry: dict) -> None:
     """Append a single run record to logs/run_log.json.
@@ -78,16 +96,19 @@ def _append_log_entry(entry: dict) -> None:
         json.dump(existing, fp, ensure_ascii=False, indent=2)
 
 
-def main() -> None:
-    """Analyse each example review and log the outcome."""
-    for example in EXAMPLE_REVIEWS:
+def _run_batch(batch: list[dict[str, str]], banner: str) -> None:
+    """Analyse every review in ``batch`` and mirror the result to the log."""
+    print(f"\n{'#' * 72}\n# {banner}\n{'#' * 72}")
+    for example in batch:
         label = example["label"]
         review = example["text"]
 
         print(f"\n=== Analysing {label.upper()} review ===")
-        print(review)
+        print(review if review else "<empty>")
 
-        # Core call into the CrewAI agent.
+        # Core call into the CrewAI agent. analyze_review never raises
+        # thanks to the W4 guardrail + try/except net, so we do not
+        # need a try/except here.
         result = analyze_review(review)
 
         # Pretty-print to the console so the demo output is legible.
@@ -104,6 +125,11 @@ def main() -> None:
         }
         _append_log_entry(log_entry)
 
+
+def main() -> None:
+    """Analyse the canonical examples then the W4 edge cases."""
+    _run_batch(EXAMPLE_REVIEWS, "Canonical reviews (positive / negative / mixed)")
+    _run_batch(EDGE_CASE_REVIEWS, "W4 edge cases (guardrails in action)")
     print(f"\nDone. Run appended to {RUN_LOG_PATH}")
 
 

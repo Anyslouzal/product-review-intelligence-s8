@@ -41,6 +41,7 @@ from langchain_openai import ChatOpenAI
 
 from agents.sentiment_agent import build_sentiment_agent
 from agents.market_agent import build_market_agent
+from tools.guardrails import validate_review
 
 # ---------------------------------------------------------------------------
 # crewai==0.5.0 workaround
@@ -316,14 +317,28 @@ def analyze_review(review_text: str) -> dict[str, Any]:
         checkpoint. Callers can catch this to skip the review or abort
         the batch.
     """
-    if not review_text or not review_text.strip():
+    # ---- W4 guardrail -------------------------------------------------
+    # Validate and sanitise the review BEFORE spinning up any agents.
+    # This prevents empty / trivial / runaway inputs from burning LLM
+    # quota or reaching the BERT tool.
+    ok, cleaned_or_reason = validate_review(review_text)
+    if not ok:
+        reason = cleaned_or_reason
+        _append_log(
+            {
+                "timestamp_utc": _utc_now(),
+                "agent": "orchestrator",
+                "task": "guardrail_rejected",
+                "output": {"input": review_text, "reason": reason},
+            }
+        )
         return {
-            "sentiment": "neutral",
+            "error": reason,
+            "sentiment": "unknown",
             "confidence": 0.0,
-            "key_themes": [],
-            "summary": "Empty review — nothing to analyse.",
-            "market_context": "",
         }
+    # From here on, work with the cleaned text.
+    review_text = cleaned_or_reason
 
     # Fresh agents per call -> no state leaks between reviews.
     sentiment_agent = build_sentiment_agent()
@@ -355,22 +370,40 @@ def analyze_review(review_text: str) -> dict[str, Any]:
         }
     )
 
+    # ---- W4 robustness --------------------------------------------------
     # kickoff() runs the tasks sequentially; per-task callbacks handle
-    # logging and the HITL checkpoint.
-    crew_output = crew.kickoff()
-    raw_text = str(getattr(crew_output, "raw", crew_output))
-
+    # logging and the HITL checkpoint. Any uncaught exception (network
+    # error, LLM timeout, HITL rejection, parser failure, …) is
+    # converted into a graceful error dict so the caller keeps running.
     try:
-        result = _coerce_to_dict(raw_text)
-    except (json.JSONDecodeError, ValueError) as exc:
-        result = {
+        crew_output = crew.kickoff()
+        raw_text = str(getattr(crew_output, "raw", crew_output))
+
+        try:
+            result = _coerce_to_dict(raw_text)
+        except (json.JSONDecodeError, ValueError) as exc:
+            result = {
+                "sentiment": "unknown",
+                "confidence": 0.0,
+                "key_themes": [],
+                "summary": "Failed to parse final report.",
+                "market_context": "",
+                "raw": raw_text,
+                "error": str(exc),
+            }
+    except Exception as exc:  # noqa: BLE001 — intentional catch-all
+        _append_log(
+            {
+                "timestamp_utc": _utc_now(),
+                "agent": "orchestrator",
+                "task": "pipeline_error",
+                "output": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        return {
+            "error": str(exc),
             "sentiment": "unknown",
             "confidence": 0.0,
-            "key_themes": [],
-            "summary": "Failed to parse final report.",
-            "market_context": "",
-            "raw": raw_text,
-            "error": str(exc),
         }
 
     _append_log(
